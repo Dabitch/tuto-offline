@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f3efe6;
+  --foreground: #1c1915;
+  --card: #faf7f1;
+  --primary: #8c3a2f;
+  --primary-foreground: #faf7f1;
+  --secondary: #e7e0d4;
+  --secondary-foreground: #1c1915;
+  --muted: #e7e0d4;
+  --muted-foreground: #5c564c;
+  --accent: #efe6c8;
+  --border: #ddd4c4;
+  --ring: #8c3a2f;
+  --moss: #2f4a3c;
+  --mark: #f3d27a;
+  --radius: 0.9rem;
+}
+
+@theme inline {
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Newsreader", ui-serif, Georgia, serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --color-moss: var(--moss);
+  --color-mark: var(--mark);
+  --radius-lg: var(--radius);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+mark {
+  background: var(--mark);
+  color: inherit;
+  padding: 0 0.12em;
+  border-radius: 0.2em;
+}
+
+button,
+input {
+  font: inherit;
+}

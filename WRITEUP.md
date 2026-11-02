@@ -1,0 +1,1 @@
+Shoebox is a private document finder for receipts, warranties, and letters. Drop in photos and PDFs. It reads them on your machine with Tesseract, stores the files and a SQLite full-text index in the app data folder, and searches instantly with highlighted snippets. Airplane mode changes nothing: nothing is uploaded and there is no account. Built for Hackyard Yard #6.
