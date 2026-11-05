@@ -111,7 +111,7 @@ pub fn ingest_samples(app: &AppHandle, state: &AppState) -> Result<ImportReport,
             continue;
         }
         if ready.iter().any(|existing| existing == &name) {
-            skipped.push(format!("{name} is already in the shoebox."));
+            skipped.push(format!("{name} is already in Tuto."));
             continue;
         }
         paths.push(path.display().to_string());
@@ -136,7 +136,7 @@ fn import_one(app: &AppHandle, state: &AppState, source: &Path) -> Result<Docume
         }
         let ext = extension(source);
         if !is_supported(source) {
-            return Err("Shoebox reads photos (PNG, JPEG, WebP, TIFF, GIF) and PDFs.".into());
+            return Err("Tuto reads photos (PNG, JPEG, WebP, TIFF, GIF) and PDFs.".into());
         }
         let dir = state.data_dir.join("library").join(id.to_string());
         fs::create_dir_all(&dir).map_err(|error| error.to_string())?;

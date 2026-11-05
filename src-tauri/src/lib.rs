@@ -30,7 +30,7 @@ fn search_papers(state: State<AppState>, query: String) -> Result<Vec<db::Search
 #[tauri::command]
 fn get_document(state: State<AppState>, id: i64) -> Result<db::DocumentDetail, String> {
     let conn = state.db.lock().map_err(|error| error.to_string())?;
-    db::get_document(&conn, id)?.ok_or_else(|| "That paper is no longer in the shoebox.".to_string())
+    db::get_document(&conn, id)?.ok_or_else(|| "That paper is no longer in Tuto.".to_string())
 }
 
 #[tauri::command]
@@ -56,7 +56,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = import::data_dir(app.handle()).map_err(std::io::Error::other)?;
-            let conn = db::open(&dir.join("shoebox.db")).map_err(std::io::Error::other)?;
+            let conn = db::open(&dir.join("tuto.db")).map_err(std::io::Error::other)?;
             app.manage(AppState {
                 db: Mutex::new(conn),
                 data_dir: dir,
@@ -73,5 +73,5 @@ pub fn run() {
             import_samples,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running shoebox");
+        .expect("error while running Tuto");
 }

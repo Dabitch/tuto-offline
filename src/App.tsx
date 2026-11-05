@@ -261,7 +261,7 @@ export default function App() {
       const report = await importSamples();
       const already = report.skipped.filter((line) => line.includes("already"));
       if (already.length && report.documents.length === 0) {
-        setBanner("Those sample papers are already in the shoebox.");
+        setBanner("Those sample papers are already in Tuto.");
       }
       await refresh();
     } catch (error) {
@@ -289,7 +289,7 @@ export default function App() {
       <header className="flex flex-col gap-4 px-4 py-4 sm:px-6">
         <div className="flex items-end justify-between gap-4">
           <div>
-            <p className="font-serif text-3xl leading-none tracking-tight">Shoebox</p>
+            <p className="font-serif text-3xl leading-none tracking-tight">Tuto</p>
             <p className="mt-1 text-sm text-muted-foreground">
               Receipts, warranties, and letters. Nothing leaves this machine.
             </p>
@@ -304,7 +304,7 @@ export default function App() {
           <Input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search the shoebox"
+            placeholder="Search your papers"
             aria-label="Search"
             className="pl-11"
             disabled={!desktop}
@@ -317,12 +317,12 @@ export default function App() {
           {!info?.tesseract && "Tesseract is missing, so photos cannot be read. "}
           {(!info?.pdftotext || !info?.pdftoppm || !info?.pdfinfo) &&
             "Poppler is missing, so PDFs cannot be read. "}
-          Install tesseract-ocr and poppler-utils, then reopen Shoebox.
+          Install tesseract-ocr and poppler-utils, then reopen Tuto.
         </div>
       )}
       {!desktop && (
         <div role="status" className="mx-4 mb-3 rounded-2xl bg-accent px-4 py-3 text-sm sm:mx-6">
-          Dropping papers and search run in the Shoebox window. This page is the same interface.
+          Dropping papers and search run in the Tuto window. This page is the same interface.
         </div>
       )}
       {loadError && (
@@ -407,7 +407,7 @@ export default function App() {
                       <HighlightedText text={activePage.text} query={trimmedQuery} />
                     ) : (
                       <p className="text-muted-foreground">
-                        Shoebox could not read any words on this page.
+                        Tuto could not read any words on this page.
                       </p>
                     )}
                   </div>
@@ -457,7 +457,7 @@ function EmptyState({
       >
         <p className="font-serif text-4xl leading-tight">Drop receipts, warranties, and letters</p>
         <p className="mx-auto mt-3 max-w-sm text-muted-foreground">
-          They stay on this machine. Shoebox reads the words, then you can search them with the
+          They stay on this machine. Tuto reads the words, then you can search them with the
           network off.
         </p>
         <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
@@ -533,7 +533,7 @@ function SearchResults({
   if (hits.length === 0) {
     return (
       <div className="px-6 py-16 text-center">
-        <p className="font-serif text-3xl">Nothing in the shoebox matches</p>
+        <p className="font-serif text-3xl">Nothing in Tuto matches</p>
         <p className="mt-2 text-muted-foreground">“{query}”</p>
       </div>
     );

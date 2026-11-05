@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Shoebox",
+  "productName": "Tuto",
   "version": "0.1.0",
-  "identifier": "app.shoebox.offline",
+  "identifier": "app.tuto.offline",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:43123",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Shoebox",
+        "title": "Tuto",
         "width": 1120,
         "height": 760,
         "minWidth": 720,
