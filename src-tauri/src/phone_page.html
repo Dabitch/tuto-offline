@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tuto</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3efe6;
+      --ink: #1c1915;
+      --card: #faf7f1;
+      --primary: #8c3a2f;
+      --primary-ink: #faf7f1;
+      --muted: #5c564c;
+      --line: #ddd4c4;
+      --moss: #2f4a3c;
+      --bad: #8c3a2f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, sans-serif;
+    }
+    main {
+      max-width: 28rem;
+      margin: 0 auto;
+      padding: 1.75rem 1.25rem 3rem;
+    }
+    .mark {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 2.4rem;
+      line-height: 1;
+    }
+    h1 {
+      margin: 0.85rem 0 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 1.7rem;
+      font-weight: 500;
+      line-height: 1.2;
+    }
+    .sub {
+      margin: 0.7rem 0 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .pick {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      min-height: 3.6rem;
+      margin-top: 0.85rem;
+      border-radius: 999px;
+      font-size: 1.05rem;
+      font-weight: 600;
+      overflow: hidden;
+    }
+    .pick input {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      font-size: 16px;
+    }
+    .camera {
+      margin-top: 1.5rem;
+      background: var(--primary);
+      color: var(--primary-ink);
+    }
+    .library {
+      background: var(--card);
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+    ul {
+      list-style: none;
+      margin: 1.5rem 0 0;
+      padding: 0;
+    }
+    li {
+      margin-top: 0.85rem;
+      padding: 0.85rem 0.95rem;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 1rem;
+    }
+    .name {
+      margin: 0;
+      font-weight: 600;
+      word-break: break-word;
+    }
+    .bar {
+      height: 0.4rem;
+      margin-top: 0.55rem;
+      background: var(--line);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .fill {
+      height: 100%;
+      width: 0;
+      background: var(--primary);
+    }
+    .state {
+      margin: 0.45rem 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+    .state.ok { color: var(--moss); font-weight: 600; }
+    .state.bad { color: var(--bad); }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="mark">Tuto</p>
+    <h1>Send papers to the laptop</h1>
+    <p class="sub">They stay on that machine. This page does not use the internet.</p>
+    <label class="pick camera">
+      Take photo
+      <input id="camera" type="file" accept="image/*,application/pdf" capture="environment" multiple>
+    </label>
+    <label class="pick library">
+      Choose files
+      <input id="library" type="file" accept="image/*,application/pdf" multiple>
+    </label>
+    <ul id="list"></ul>
+  </main>
+  <script>
+    (function () {
+      var list = document.getElementById("list");
+      var queue = [];
+      var busy = false;
+      var limit = 25 * 1024 * 1024;
+
+      function rowFor(file) {
+        var li = document.createElement("li");
+        var name = document.createElement("p");
+        name.className = "name";
+        name.textContent = file.name || "photo";
+        var bar = document.createElement("div");
+        bar.className = "bar";
+        var fill = document.createElement("div");
+        fill.className = "fill";
+        bar.appendChild(fill);
+        var state = document.createElement("p");
+        state.className = "state";
+        state.textContent = "Waiting…";
+        li.appendChild(name);
+        li.appendChild(bar);
+        li.appendChild(state);
+        list.appendChild(li);
+        return { fill: fill, state: state, bar: bar };
+      }
+
+      function finish(row, ok, text) {
+        row.bar.remove();
+        row.state.textContent = text;
+        row.state.className = ok ? "state ok" : "state bad";
+      }
+
+      function send(file, done) {
+        var row = rowFor(file);
+        if (file.size > limit) {
+          finish(row, false, "Larger than 25 MB.");
+          done();
+          return;
+        }
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", location.pathname);
+        xhr.timeout = 120000;
+        xhr.upload.onprogress = function (event) {
+          if (!event.lengthComputable || event.total === 0) {
+            return;
+          }
+          var pct = Math.round((event.loaded / event.total) * 100);
+          row.fill.style.width = pct + "%";
+          row.state.textContent = pct >= 100 ? "Reading on the laptop…" : "Sending " + pct + "%";
+        };
+        xhr.onload = function () {
+          var data = {};
+          try {
+            data = JSON.parse(xhr.responseText || "{}");
+          } catch (error) {
+            data = {};
+          }
+          if (xhr.status >= 200 && xhr.status < 300 && data.ok) {
+            finish(row, true, "\u2713 Saved on the laptop");
+          } else {
+            finish(row, false, data.error || "The laptop could not take this file.");
+          }
+          done();
+        };
+        xhr.onerror = function () {
+          finish(row, false, "Could not reach the laptop. Stay on the same Wi-Fi and try again.");
+          done();
+        };
+        xhr.ontimeout = function () {
+          finish(row, false, "The laptop took too long. Try a smaller photo.");
+          done();
+        };
+        var body = new FormData();
+        body.append("file", file, file.name || "photo");
+        row.state.textContent = "Sending…";
+        xhr.send(body);
+      }
+
+      function pump() {
+        if (busy || queue.length === 0) {
+          return;
+        }
+        busy = true;
+        var file = queue.shift();
+        send(file, function () {
+          busy = false;
+          pump();
+        });
+      }
+
+      function take(input) {
+        var files = input.files ? Array.prototype.slice.call(input.files) : [];
+        input.value = "";
+        files.forEach(function (file) { queue.push(file); });
+        pump();
+      }
+
+      document.getElementById("camera").addEventListener("change", function (event) {
+        take(event.target);
+      });
+      document.getElementById("library").addEventListener("change", function (event) {
+        take(event.target);
+      });
+    })();
+  </script>
+</body>
+</html>

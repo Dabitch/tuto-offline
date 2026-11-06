@@ -1,13 +1,14 @@
 # Demo video
 
-About 90 seconds. Record on a machine where the network icon can be seen. All of the papers in `fixtures/samples` are fake.
+About two minutes. Record on a machine where the network icon can be seen. All of the papers in `fixtures/samples` are fake.
 
 1. **0:00 Hook.** A messy pile of papers. "Where's the dishwasher warranty?"
 2. **0:08 Airplane mode.** Open Control Center, turn airplane mode on, and leave the Wi-Fi off icon in frame. On Linux, turn Wi-Fi off in the system menu instead.
 3. **0:15 Drop.** Drag about 10 of the sample photos and PDFs into Tuto. The rows switch from "Reading" to a page count as Tesseract and Poppler finish on this machine.
 4. **0:35 Search.** Type `dishwasher warranty`. The warranty card and the care guide come back with the matching words highlighted.
 5. **0:50 Two more searches.** `total 42.99` finds the Cedar and Co Hardware receipt. `Mara Ellison` finds the letter.
-6. **1:05 Local only.** Point at the footer path (`~/.local/share/app.tuto.offline`). Open that folder and show the copied papers and `tuto.db`. Nothing was uploaded.
-7. **1:15 Install.** On a Mac, download the `.dmg`, drag Tuto to Applications, and the first time right-click the app and choose Open, because it is unsigned. On Linux, run the AppImage or install the `.deb`. Close on the repository link.
+6. **1:05 Phone drop, still off the internet.** Turn Wi-Fi back on so the laptop and the phone share the access point, and leave the internet disconnected (unplug the WAN, or use a hotspot with no data). Open **Phone drop**. The QR code is a local address such as `http://192.168.x.x:8787/drop/…`. On the phone, scan it, take a photo of a receipt, and watch the laptop toast “From phone: …” while the network icon still shows no internet. Close the panel when the photo is in the library.
+7. **1:35 Local only.** Point at the footer path (`~/.local/share/app.tuto.offline`). Open that folder and show the copied papers and `tuto.db`. Nothing was uploaded.
+8. **1:45 Install.** On a Mac, download the `.dmg`, drag Tuto to Applications, and the first time right-click the app and choose Open, because it is unsigned. On Linux, run the AppImage or install the `.deb`. Close on the repository link.
 
 No new features after the recording starts. If a page reads poorly, that is the crooked phone photo of the cafe receipt: say so, and show that the straight copy of the same receipt still searches.

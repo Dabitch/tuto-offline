@@ -1,6 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import type { AppInfo, DocumentDetail, DocumentSummary, ImportReport, SearchHit } from "./types";
+import type {
+  AppInfo,
+  DocumentDetail,
+  DocumentSummary,
+  ImportReport,
+  PhoneDropSession,
+  SearchHit,
+} from "./types";
 
 export function inDesktopApp() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -28,4 +35,12 @@ export function importPaths(paths: string[]) {
 
 export function importSamples() {
   return invoke<ImportReport>("import_samples");
+}
+
+export function startPhoneDrop() {
+  return invoke<PhoneDropSession>("phone_drop_start");
+}
+
+export function stopPhoneDrop() {
+  return invoke<void>("phone_drop_stop");
 }

@@ -1,6 +1,6 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowLeft, Plus, Search } from "lucide-react";
+import { ArrowLeft, Plus, Search, Smartphone, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { HighlightedText, SnippetText } from "@/components/highlight";
@@ -16,8 +16,16 @@ import {
   inDesktopApp,
   listDocuments,
   searchPapers,
+  startPhoneDrop,
+  stopPhoneDrop,
 } from "@/lib/api";
-import type { AppInfo, DocumentDetail, DocumentSummary, SearchHit } from "@/lib/types";
+import type {
+  AppInfo,
+  DocumentDetail,
+  DocumentSummary,
+  PhoneDropSession,
+  SearchHit,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PAPER_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "tif", "tiff", "gif", "pdf"];
@@ -86,6 +94,13 @@ export default function App() {
   const [selectedPage, setSelectedPage] = useState(1);
   const [detail, setDetail] = useState<DocumentDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [phoneOpen, setPhoneOpen] = useState(false);
+  const [phoneSession, setPhoneSession] = useState<PhoneDropSession | null>(null);
+  const [phoneError, setPhoneError] = useState<string | null>(null);
+  const [phoneSeen, setPhoneSeen] = useState(false);
+  const [phoneStarting, setPhoneStarting] = useState(false);
+  const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
+  const toastId = useRef(0);
   const queryRef = useRef(query);
   queryRef.current = query;
 
@@ -148,6 +163,53 @@ export default function App() {
     return () => {
       cancelled = true;
       unlisten?.();
+    };
+  }, [desktop]);
+
+  function pushToast(text: string) {
+    const id = toastId.current + 1;
+    toastId.current = id;
+    setToasts((current) => [...current, { id, text }]);
+    window.setTimeout(() => {
+      setToasts((current) => current.filter((toast) => toast.id !== id));
+    }, 4200);
+  }
+
+  useEffect(() => {
+    if (!desktop) {
+      return;
+    }
+    let unlistenDrop: (() => void) | undefined;
+    let unlistenSeen: (() => void) | undefined;
+    let unlistenClosed: (() => void) | undefined;
+    let cancelled = false;
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      if (cancelled) {
+        return;
+      }
+      unlistenDrop = await listen<{ name?: string } | string>("phone-drop", (event) => {
+        const payload = event.payload;
+        const name =
+          typeof payload === "string" ? payload : payload?.name?.trim() || "a paper";
+        pushToast(`From phone: ${name}`);
+      });
+      unlistenSeen = await listen("phone-drop-seen", () => {
+        setPhoneSeen(true);
+      });
+      unlistenClosed = await listen<{ reason: string }>("phone-drop-closed", (event) => {
+        setPhoneOpen(false);
+        setPhoneSession(null);
+        setPhoneSeen(false);
+        if (event.payload.reason === "idle") {
+          setBanner("Phone drop closed after 15 minutes of quiet.");
+        }
+      });
+    });
+    return () => {
+      cancelled = true;
+      unlistenDrop?.();
+      unlistenSeen?.();
+      unlistenClosed?.();
     };
   }, [desktop]);
 
@@ -254,6 +316,34 @@ export default function App() {
     await addPaths(Array.isArray(picked) ? picked : [picked]);
   }
 
+  async function openPhoneDrop() {
+    setPhoneOpen(true);
+    setPhoneError(null);
+    setPhoneSeen(false);
+    setPhoneStarting(true);
+    try {
+      const session = await startPhoneDrop();
+      setPhoneSession(session);
+    } catch (error) {
+      setPhoneSession(null);
+      setPhoneError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPhoneStarting(false);
+    }
+  }
+
+  async function closePhoneDrop() {
+    setPhoneOpen(false);
+    setPhoneSession(null);
+    setPhoneSeen(false);
+    setPhoneError(null);
+    try {
+      await stopPhoneDrop();
+    } catch {
+      // The panel is already closed. The server stops with the process if this fails.
+    }
+  }
+
   async function loadSamples() {
     setImporting(true);
     setBanner(null);
@@ -294,10 +384,20 @@ export default function App() {
               Receipts, warranties, and letters. Nothing leaves this machine.
             </p>
           </div>
-          <Button onClick={() => void chooseFiles()} disabled={!desktop || importing}>
-            <Plus />
-            Add papers
-          </Button>
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button
+              variant="outline"
+              onClick={() => void openPhoneDrop()}
+              disabled={!desktop || phoneStarting}
+            >
+              <Smartphone />
+              Phone drop
+            </Button>
+            <Button onClick={() => void chooseFiles()} disabled={!desktop || importing}>
+              <Plus />
+              Add papers
+            </Button>
+          </div>
         </div>
         <div className="relative">
           <Search className="pointer-events-none absolute top-1/2 left-4 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -428,6 +528,130 @@ export default function App() {
       {dragging && (
         <div className="pointer-events-none fixed inset-3 rounded-3xl border-2 border-dashed border-primary bg-primary/10" />
       )}
+
+      {phoneOpen && (
+        <PhoneDropPanel
+          session={phoneSession}
+          starting={phoneStarting}
+          error={phoneError}
+          seen={phoneSeen}
+          onClose={() => void closePhoneDrop()}
+        />
+      )}
+
+      {toasts.length > 0 && (
+        <div className="pointer-events-none fixed right-4 bottom-4 z-30 flex w-[min(22rem,calc(100%-2rem))] flex-col gap-2">
+          {toasts.map((toast) => (
+            <p
+              key={toast.id}
+              role="status"
+              className="rounded-2xl bg-foreground px-4 py-3 text-sm text-background shadow-lg"
+            >
+              {toast.text}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PhoneDropPanel({
+  session,
+  starting,
+  error,
+  seen,
+  onClose,
+}: {
+  session: PhoneDropSession | null;
+  starting: boolean;
+  error: string | null;
+  seen: boolean;
+  onClose: () => void;
+}) {
+  const qr =
+    session?.qrSvg.startsWith("<svg") && !session.qrSvg.toLowerCase().includes("<script")
+      ? session.qrSvg
+      : "";
+  const others = session?.addresses.filter((address) => address.url !== session.primaryUrl) ?? [];
+  return (
+    <div
+      className="fixed inset-0 z-20 flex items-end justify-center bg-foreground/40 p-3 sm:items-center"
+      role="presentation"
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="phone-drop-title"
+        className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-3xl bg-card p-6 shadow-xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 id="phone-drop-title" className="font-serif text-3xl leading-none">
+              Phone drop
+            </h2>
+            <p className="mt-2 text-sm text-muted-foreground">
+              The phone and this laptop stay on the same Wi-Fi. The internet can stay off.
+            </p>
+          </div>
+          <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close phone drop">
+            <X />
+          </Button>
+        </div>
+
+        {starting && <p className="mt-6 text-sm text-muted-foreground">Opening a local page…</p>}
+        {error && (
+          <p role="alert" className="mt-6 text-sm text-primary">
+            {error}
+          </p>
+        )}
+        {session && (
+          <div className="mt-5">
+            {qr ? (
+              <div
+                className="mx-auto w-fit rounded-2xl bg-[#faf7f1] p-3"
+                dangerouslySetInnerHTML={{ __html: qr }}
+              />
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                The QR code could not be drawn. Type the address on the phone instead.
+              </p>
+            )}
+            <p className="mt-3 text-center font-mono text-xs break-all">{session.primaryUrl}</p>
+            {others.length > 0 && (
+              <div className="mt-4">
+                <p className="text-sm font-medium">Other addresses on this laptop</p>
+                <ul className="mt-2 space-y-2">
+                  {others.map((address) => (
+                    <li key={address.url} className="text-xs break-all text-muted-foreground">
+                      <span className="font-medium text-foreground">{address.name}</span> {address.url}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {seen ? (
+              <p className="mt-4 text-sm text-moss">
+                The phone opened the page. Photos you send show up in the library.
+              </p>
+            ) : (
+              <p className="mt-4 text-sm text-muted-foreground">
+                Waiting for the phone. If the page will not load, a firewall may be blocking port{" "}
+                {session.port}. When ufw is active, run{" "}
+                <span className="font-mono">sudo ufw allow {session.port}/tcp</span>, then try another
+                address in the list.
+              </p>
+            )}
+            <p className="mt-3 text-xs leading-5 text-muted-foreground">
+              This link is only on the local network. It stops when you close this panel, or after{" "}
+              {session.idleMinutes} minutes of quiet. Someone on this Wi-Fi who has the link can send
+              a file until then.
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

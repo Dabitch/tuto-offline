@@ -38,16 +38,24 @@ On Hyprland, start the AppImage with `WEBKIT_DISABLE_DMABUF_RENDERER=1`. WebKitG
 
 The same Tesseract path is used on every platform so the app can be tested without Apple's Vision framework. A Mac build can later swap in a Vision sidecar behind that one function.
 
+## Phone drop
+
+Phone drop is a page on the laptop, not a cloud upload. Open **Phone drop** in Tuto. The laptop listens on its own Wi-Fi addresses, starting at port 8787, and shows a QR code for a one-time link. The phone and the laptop have to be on that same network. The internet can stay off. Snap a photo or choose a PDF. It is copied, read, and indexed the same way as a file dropped on the desktop, and the library updates immediately.
+
+The link contains a random token. Anything else is refused. Each file can be up to 25 MB, and only JPEG, PNG, WebP, GIF, TIFF, and PDF are accepted. The page closes when you close the panel, or after 15 minutes with no visitors. Tuto never listens on every interface (`0.0.0.0`): a phone off the local network cannot connect. Anyone on that Wi-Fi who can see the link can send a file until the page closes.
+
+On Linux a firewall can block the port. If the phone cannot open the page and `ufw` is active, allow the port shown in the panel (`sudo ufw allow 8787/tcp` when it is still 8787).
+
 ## Supported files and limits
 
 - Photos: PNG, JPEG, WebP, TIFF, GIF
 - PDFs, including multi-page files
 - English text only
 - The first 30 pages of a PDF
-- Files up to 40 MB
+- Files up to 40 MB from the desktop, and 25 MB from the phone
 - A crooked photo still runs through OCR, and a bad phone picture can come back garbled. A straight copy of the same page reads more reliably.
 
-Tuto does not sync, sign in, capture from a camera, summarize with a cloud model, or encrypt the library at rest.
+Tuto does not sync, sign in, summarize with a cloud model, or encrypt the library at rest. A phone can hand a photo across the home Wi-Fi. That transfer stays on the local network.
 
 ## Try the sample papers
 

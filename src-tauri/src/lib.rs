@@ -2,6 +2,7 @@ mod db;
 mod import;
 mod ocr;
 mod pdf;
+mod phone;
 mod query;
 mod tools;
 
@@ -50,6 +51,16 @@ fn import_samples(
     import::ingest_samples(&app, &state)
 }
 
+#[tauri::command]
+fn phone_drop_start(app: tauri::AppHandle) -> Result<phone::PhoneDropInfo, String> {
+    phone::start(&app)
+}
+
+#[tauri::command]
+fn phone_drop_stop(app: tauri::AppHandle) {
+    phone::stop(&app);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -61,6 +72,7 @@ pub fn run() {
                 db: Mutex::new(conn),
                 data_dir: dir,
                 tools: tools::Tools::detect(),
+                phone: phone::PhoneDrop::new(),
             });
             Ok(())
         })
@@ -71,6 +83,8 @@ pub fn run() {
             get_document,
             import_paths,
             import_samples,
+            phone_drop_start,
+            phone_drop_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tuto");

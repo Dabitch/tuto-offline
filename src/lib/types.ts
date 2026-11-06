@@ -46,3 +46,22 @@ export type ImportReport = {
   documents: DocumentSummary[];
   skipped: string[];
 };
+
+export type PhoneAddress = {
+  name: string;
+  ip: string;
+  url: string;
+};
+
+export type PhoneDropSession = {
+  port: number;
+  token: string;
+  addresses: PhoneAddress[];
+  primaryUrl: string;
+  qrSvg: string;
+  idleMinutes: number;
+};
+
+export type PhoneNotice = {
+  name: string;
+};

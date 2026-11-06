@@ -16,6 +16,7 @@ pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     pub data_dir: PathBuf,
     pub tools: Tools,
+    pub phone: crate::phone::PhoneDrop,
 }
 
 #[derive(serde::Serialize)]
@@ -121,7 +122,7 @@ pub fn ingest_samples(app: &AppHandle, state: &AppState) -> Result<ImportReport,
     Ok(report)
 }
 
-fn import_one(app: &AppHandle, state: &AppState, source: &Path) -> Result<DocumentSummary, String> {
+pub(crate) fn import_one(app: &AppHandle, state: &AppState, source: &Path) -> Result<DocumentSummary, String> {
     let name = display_name(source);
     let id = {
         let conn = state.db.lock().map_err(|error| error.to_string())?;
