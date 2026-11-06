@@ -46,7 +46,7 @@ The link contains a random token. Anything else is refused. Each file can be up 
 
 On Linux a firewall can block the port. If the phone cannot open the page and `ufw` is active, allow the port shown in the panel (`sudo ufw allow 8787/tcp` when it is still 8787).
 
-The page sends one file at a time and retries. If Chrome on the phone will not open the link, type the address under the QR code. HEIC photos are not read: set the camera to JPEG and take the photo again. The laptop confirms the file as soon as it arrives, then reads it in the background.
+The page sends one file at a time and retries. If Chrome is set to always use secure connections, it tries HTTPS on this same port first. Tuto answers that probe with a TLS alert so Chrome can come back to the http link. HEIC photos are not read: set the camera to JPEG and take the photo again. The laptop confirms the file as soon as it arrives, then reads it in the background.
 
 ## Supported files and limits
 

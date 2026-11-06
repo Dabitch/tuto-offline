@@ -1,6 +1,5 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -332,7 +331,7 @@ fn handle_socket(mut sock: TcpStream, ctx: &Handler) {
     ) {
         Ok(incoming) => incoming,
         Err(SocketRead::Tls) => {
-            reset_connection(&sock);
+            reject_tls(&mut sock);
             return;
         }
         Err(_) => return,
@@ -340,7 +339,7 @@ fn handle_socket(mut sock: TcpStream, ctx: &Handler) {
     note_activity(&ctx.shared);
     let reply = dispatch(incoming, ctx);
     let _ = write_reply(&mut sock, &reply);
-    let _ = sock.shutdown(Shutdown::Both);
+    let _ = sock.shutdown(Shutdown::Write);
     note_activity(&ctx.shared);
 }
 
@@ -773,20 +772,25 @@ fn read_line(sock: &mut TcpStream, pending: &mut Vec<u8>) -> std::io::Result<Str
     }
 }
 
-fn reset_connection(sock: &TcpStream) {
-    unsafe {
-        let linger = libc::linger {
-            l_onoff: 1,
-            l_linger: 0,
-        };
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_LINGER,
-            &linger as *const libc::linger as *const libc::c_void,
-            std::mem::size_of::<libc::linger>() as libc::socklen_t,
-        );
+fn reject_tls(sock: &mut TcpStream) {
+    // The ClientHello is already partly read. Drain the rest so closing the
+    // socket is a FIN. Closing with unread bytes makes Linux send a RST, and
+    // current Android Chrome retries a reset until it shows ERR_TOO_MANY_RETRIES
+    // instead of falling back to HTTP.
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut ignore = [0u8; 2048];
+    loop {
+        match sock.read(&mut ignore) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
     }
+    // Fatal handshake_failure. Chrome records this as
+    // ERR_SSL_VERSION_OR_CIPHER_MISMATCH and does not retry it.
+    let alert = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+    let _ = sock.write_all(&alert);
+    let _ = sock.flush();
+    let _ = sock.shutdown(Shutdown::Write);
 }
 
 impl HttpError {
@@ -1589,7 +1593,7 @@ PNG\r\n\
     }
 
     #[test]
-    fn tls_client_hello_is_reset_without_an_http_reply() {
+    fn tls_client_hello_gets_a_fatal_alert() {
         let server = serve_loopback(1024, Duration::from_secs(30));
         let mut sock = TcpStream::connect(("127.0.0.1", server.info.port)).unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -1598,22 +1602,18 @@ PNG\r\n\
         let started = Instant::now();
         sock.write_all(&[0x16, 0x03, 0x01, 0x00, 0x2a, 0x01, 0x00, 0x00, 0x26])
             .unwrap();
-        let mut buf = [0u8; 32];
-        let read = sock.read(&mut buf);
+        let mut buf = [0u8; 16];
+        let n = sock.read(&mut buf).expect("tls alert");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "tls probe hung for {:?}",
             started.elapsed()
         );
-        match read {
-            Ok(0) => {}
-            Ok(n) => assert!(
-                !buf[..n].starts_with(b"HTTP"),
-                "wrote http into a tls handshake: {:?}",
-                &buf[..n]
-            ),
-            Err(_) => {}
-        }
+        assert!(
+            buf[..n].starts_with(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]),
+            "expected a fatal handshake_failure alert, got {:02x?}",
+            &buf[..n]
+        );
     }
 
     #[test]
@@ -1741,6 +1741,153 @@ PNG\r\n\
         if let Some(session) = slot.lock().unwrap().take() {
             session.shutdown();
         }
+    }
+
+    #[test]
+    fn https_first_on_a_lan_address_is_an_ssl_mismatch() {
+        let Some(bind) = lan_interfaces()
+            .ok()
+            .and_then(|list| list.into_iter().next())
+        else {
+            return;
+        };
+        let slot: Arc<StdMutex<Option<Session>>> = Arc::new(StdMutex::new(None));
+        let slot_idle = Arc::clone(&slot);
+        let started = open_server(OpenConfig {
+            bind: vec![bind],
+            port_start: 0,
+            port_attempts: 1,
+            idle: Duration::from_secs(60),
+            poll: Duration::from_millis(40),
+            max_file_bytes: 1024,
+            on_file: Arc::new(|_| Ok(())),
+            on_seen: Arc::new(|| {}),
+            on_idle: Arc::new(move || {
+                if let Some(session) = slot_idle.lock().unwrap().take() {
+                    session.shutdown();
+                }
+            }),
+            generation: 4,
+        })
+        .unwrap();
+        let info = started.info.clone();
+        *slot.lock().unwrap() = Some(started.session);
+        let dir = std::env::temp_dir().join(format!("tuto-hfm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Default")).unwrap();
+        std::fs::write(
+            dir.join("Default/Preferences"),
+            r#"{"https_only_mode_enabled":true}"#,
+        )
+        .unwrap();
+        let netlog = dir.join("netlog.json");
+        let debug = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let mut chrome = Command::new("google-chrome")
+            .args([
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--no-first-run",
+                "--enable-features=HttpsUpgrades,HttpsFirstModeV2",
+                &format!("--remote-debugging-port={debug}"),
+                "--remote-allow-origins=*",
+                &format!("--user-data-dir={}", dir.display()),
+                &format!("--log-net-log={}", netlog.display()),
+                "about:blank",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("google-chrome");
+        let script = r#"
+const [debug, url] = process.argv.slice(2);
+let version = null;
+for (let attempt = 0; attempt < 40; attempt += 1) {
+  try {
+    version = await (await fetch(`http://127.0.0.1:${debug}/json/version`)).json();
+    break;
+  } catch (error) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+if (!version) throw new Error('devtools did not open');
+const browser = new WebSocket(version.webSocketDebuggerUrl);
+await new Promise((resolve, reject) => {
+  browser.addEventListener('open', resolve);
+  browser.addEventListener('error', () => reject(new Error('ws')));
+});
+let id = 0;
+const pending = new Map();
+browser.addEventListener('message', (event) => {
+  const message = JSON.parse(event.data);
+  if (message.id && pending.has(message.id)) pending.get(message.id)(message);
+});
+const call = (method, params, sessionId) => new Promise((resolve, reject) => {
+  const thisId = ++id;
+  const timer = setTimeout(() => reject(new Error('timeout ' + method)), 12000);
+  pending.set(thisId, (message) => { clearTimeout(timer); resolve(message.result || {}); });
+  browser.send(JSON.stringify({ id: thisId, method, params, sessionId }));
+});
+const created = await call('Target.createTarget', { url: 'about:blank' });
+const attached = await call('Target.attachToTarget', { targetId: created.targetId, flatten: true });
+await call('Page.enable', {}, attached.sessionId);
+await call('Page.navigate', { url }, attached.sessionId);
+await new Promise((resolve) => setTimeout(resolve, 4000));
+const info = await call('Runtime.evaluate', {
+  expression: 'location.href + " " + (document.body ? document.body.innerText : "")',
+  returnByValue: true,
+}, attached.sessionId);
+console.log(info.result && info.result.value || '');
+process.exit(0);
+"#;
+        let script_path = dir.join("nav.mjs");
+        std::fs::write(&script_path, script).unwrap();
+        let script_arg = script_path.to_string_lossy().into_owned();
+        let debug_arg = debug.to_string();
+        let output = Command::new("node")
+            .args([&script_arg, &debug_arg, &info.primary_url])
+            .output();
+        let mut log = String::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            log = std::fs::read_to_string(&netlog).unwrap_or_default();
+            if log.contains("-113") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = chrome.kill();
+        let _ = chrome.wait();
+        if let Some(session) = slot.lock().unwrap().take() {
+            session.shutdown();
+        }
+        let output = output.expect("node");
+        let page = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            page.contains("Send papers") || page.contains("chrome-error://"),
+            "https-first navigation did not finish\n{page}"
+        );
+        let saw_mismatch =
+            log.contains("\"net_error\": -113") || log.contains("\"net_error\":-113");
+        let saw_reset = log.contains("\"net_error\": -101") || log.contains("\"net_error\":-101");
+        assert!(
+            saw_mismatch || page.contains("Send papers"),
+            "Chrome did not record the TLS alert as an SSL mismatch (log {} bytes).\n{page}",
+            log.len()
+        );
+        assert!(
+            !saw_reset,
+            "Chrome still saw a TCP reset on the HTTPS probe"
+        );
     }
 
     #[test]
