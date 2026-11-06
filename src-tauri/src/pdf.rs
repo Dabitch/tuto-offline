@@ -155,7 +155,7 @@ mod tests {
         if !tools.pdftotext {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("shoebox-letter-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tuto-letter-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -172,7 +172,7 @@ mod tests {
         if !tools.pdftotext || !tools.pdftoppm || !tools.tesseract {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("shoebox-scan-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tuto-scan-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path =

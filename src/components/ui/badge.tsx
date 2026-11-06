@@ -10,7 +10,7 @@ const badgeVariants = cva(
       variant: {
         default: "bg-secondary text-secondary-foreground",
         reading: "bg-accent text-foreground",
-        error: "bg-primary/10 text-primary",
+        error: "bg-[#3c2430] text-[#f3c7bc]",
         ready: "bg-moss/10 text-moss",
       },
     },

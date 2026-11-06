@@ -1,12 +1,14 @@
 # Tuto
 
-From the Latin *in tuto*, in safety. Your home is the castle: drop in receipts, warranties, and letters, then search “dishwasher warranty.” Airplane mode on, it still works, and nothing is uploaded.
+The permission slip was in the van. The warranty was “in the kitchen drawer,” which also held a birthday candle, two Allen keys, and no warranty. School forms arrive the morning they are due. Receipts live in coat pockets until laundry day files them under gone.
+
+Tuto is the vault for that pile. From the Latin *in tuto*, in safety: the house is the castle, and the papers stay inside it. Snap a photo on your phone, send it across the home Wi-Fi, and it lands on the laptop. Later you search “dishwasher warranty” and the words light up. Airplane mode on, it still works, and nothing is uploaded.
 
 ![Search results for dishwasher warranty, with the matching words highlighted](docs/search.png)
 
 ## Why offline
 
-Tuto is a private finder for paper you already have, a Fort Knox that never leaves the house. There is no account, no sync, and no telemetry. Photos and PDFs are copied into the app data folder, read on this machine, and indexed in a local SQLite database. Turning the network off changes nothing, because the app never asks the network for anything.
+A shared drive is just another drawer, plus a password. Tuto is a private finder for paper you already have. There is no account, no sync, and no telemetry. Photos and PDFs are copied into the app data folder, read on this machine, and indexed in a local SQLite database. Turning the network off changes nothing, because the app never asks the network for anything.
 
 ## Install
 

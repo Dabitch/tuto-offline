@@ -202,7 +202,7 @@ def main() -> None:
     render_doc(
         "photo-folded-note.png",
         "NOTE IN THE BOX",
-        "Found in the shoebox.\n\nThe dishwasher hose was bought at Cedar and Co Hardware.\n"
+        "Found in the kitchen drawer.\n\nThe dishwasher hose was bought at Cedar and Co Hardware.\n"
         "The warranty card is the red one.\n\nDo not throw out the warranty.",
         accent=(90, 70, 40),
     )

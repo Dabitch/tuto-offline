@@ -53,6 +53,20 @@ function formatWhen(iso: string) {
   });
 }
 
+function MoonMark() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 72 36" className="mt-1 h-8 w-14 shrink-0">
+      <circle cx="60" cy="10" r="8" fill="#f4f7ff" />
+      <g fill="#e2b15a">
+        <rect x="1" y="20" width="44" height="14" />
+        <rect x="1" y="12" width="10" height="10" />
+        <rect x="18" y="12" width="10" height="10" />
+        <rect x="35" y="12" width="10" height="10" />
+      </g>
+    </svg>
+  );
+}
+
 function PaperThumb({ path, name }: { path: string | null; name: string }) {
   if (!path) {
     return (
@@ -65,7 +79,7 @@ function PaperThumb({ path, name }: { path: string | null; name: string }) {
     <img
       src={convertFileSrc(path)}
       alt=""
-      className="h-16 w-14 shrink-0 rounded-md border border-border bg-white object-cover object-top"
+      className="h-16 w-14 shrink-0 rounded-md border border-border bg-[#dfe7f2] object-cover object-top"
     />
   );
 }
@@ -375,16 +389,19 @@ export default function App() {
     detail?.pages.find((page) => page.pageNumber === selectedPage) ?? detail?.pages[0];
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
+    <div className="flex h-full min-h-0 flex-col bg-transparent text-foreground">
       <header className="flex flex-col gap-4 px-4 py-4 sm:px-6">
-        <div className="flex items-end justify-between gap-4">
-          <div>
-            <p className="font-serif text-3xl leading-none tracking-tight">Tuto</p>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Receipts, warranties, and letters. Nothing leaves this machine.
-            </p>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div className="flex items-start gap-3">
+            <MoonMark />
+            <div>
+              <p className="font-serif text-3xl leading-none tracking-tight">Tuto</p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Receipts, warranties, and letters. Nothing leaves this machine.
+              </p>
+            </div>
           </div>
-          <div className="flex flex-wrap justify-end gap-2">
+          <div className="flex flex-wrap justify-start gap-2 sm:justify-end">
             <Button
               variant="outline"
               onClick={() => void openPhoneDrop()}
@@ -411,6 +428,7 @@ export default function App() {
           />
         </div>
       </header>
+      <div className="crenel" aria-hidden="true" />
 
       {missingTools && (
         <div role="alert" className="mx-4 mb-3 rounded-2xl bg-primary/10 px-4 py-3 text-sm text-primary sm:mx-6">
@@ -499,7 +517,7 @@ export default function App() {
                     <img
                       src={convertFileSrc(activePage.imagePath)}
                       alt={`Page ${activePage.pageNumber} of ${detail.originalName}`}
-                      className="mt-4 max-h-72 w-full rounded-xl border border-border bg-white object-contain object-top"
+                      className="mt-4 max-h-72 w-full rounded-xl border border-border bg-[#dfe7f2] object-contain object-top"
                     />
                   )}
                   <div className="mt-4 text-sm leading-6 whitespace-pre-wrap">
@@ -576,7 +594,7 @@ function PhoneDropPanel({
   const others = session?.addresses.filter((address) => address.url !== session.primaryUrl) ?? [];
   return (
     <div
-      className="fixed inset-0 z-20 flex items-end justify-center bg-foreground/40 p-3 sm:items-center"
+      className="fixed inset-0 z-20 flex items-end justify-center bg-[#070b16]/75 p-3 sm:items-center"
       role="presentation"
       onClick={onClose}
     >
@@ -611,7 +629,7 @@ function PhoneDropPanel({
           <div className="mt-5">
             {qr ? (
               <div
-                className="mx-auto w-fit rounded-2xl bg-[#faf7f1] p-3"
+                className="mx-auto w-fit rounded-2xl bg-[#e8eef8] p-3"
                 dangerouslySetInnerHTML={{ __html: qr }}
               />
             ) : (
