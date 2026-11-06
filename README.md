@@ -6,6 +6,10 @@ Tuto is the vault for that pile. From the Latin *in tuto*, in safety: the house 
 
 ![Search results for dishwasher warranty, with the matching words highlighted](docs/search.png)
 
+![The phone drop page, ready for a photo](docs/phone-drop.png)
+
+Take a photo. It crosses the home Wi-Fi and lands in the vault.
+
 ## Why offline
 
 A shared drive is just another drawer, plus a password. Tuto is a private finder for paper you already have. There is no account, no sync, and no telemetry. Photos and PDFs are copied into the app data folder, read on this machine, and indexed in a local SQLite database. Turning the network off changes nothing, because the app never asks the network for anything.
