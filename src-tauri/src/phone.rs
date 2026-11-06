@@ -1,15 +1,15 @@
-use std::io::{Cursor, Read};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use qrcode::QrCode;
 use qrcode::render::svg;
+use qrcode::QrCode;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
-use tiny_http::{Header, ListenAddr, Method, Request, Response, Server, StatusCode};
 
 use crate::import::{self, AppState};
 
@@ -55,7 +55,7 @@ struct PhoneClosed {
 struct Session {
     generation: u64,
     shared: Arc<Shared>,
-    workers: Vec<JoinHandle<()>>,
+    acceptors: Vec<JoinHandle<()>>,
     idle: Option<JoinHandle<()>>,
 }
 
@@ -64,7 +64,6 @@ struct Shared {
     last_activity: Mutex<Instant>,
     wake: Condvar,
     connected: AtomicBool,
-    servers: Mutex<Vec<Arc<Server>>>,
 }
 
 pub struct PhoneDrop {
@@ -176,7 +175,11 @@ fn spawn_drop(
 
 fn replace_session(app: &AppHandle, session: Session) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut guard = state.phone.inner.lock().map_err(|error| error.to_string())?;
+    let mut guard = state
+        .phone
+        .inner
+        .lock()
+        .map_err(|error| error.to_string())?;
     let previous = guard.replace(session);
     drop(guard);
     if let Some(previous) = previous {
@@ -257,13 +260,11 @@ fn open_server(config: OpenConfig) -> Result<Started, String> {
         qr_svg: qr_svg(&primary_url).unwrap_or_default(),
         idle_minutes: IDLE_MINUTES,
     };
-    let servers = servers.into_iter().map(Arc::new).collect::<Vec<_>>();
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
         last_activity: Mutex::new(Instant::now()),
         wake: Condvar::new(),
         connected: AtomicBool::new(false),
-        servers: Mutex::new(servers.clone()),
     });
     let ctx = Arc::new(Handler {
         token,
@@ -273,13 +274,17 @@ fn open_server(config: OpenConfig) -> Result<Started, String> {
         shared: Arc::clone(&shared),
         nonce: AtomicU64::new(1),
     });
-    let mut workers = Vec::new();
-    for server in servers {
+    let mut acceptors = Vec::new();
+    for listener in servers {
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
         let ctx = Arc::clone(&ctx);
-        workers.push(
+        let shared = Arc::clone(&shared);
+        acceptors.push(
             thread::Builder::new()
                 .name("tuto-phone".into())
-                .spawn(move || worker_loop(server, ctx))
+                .spawn(move || accept_loop(listener, ctx, shared))
                 .map_err(|error| error.to_string())?,
         );
     }
@@ -295,29 +300,48 @@ fn open_server(config: OpenConfig) -> Result<Started, String> {
         session: Session {
             generation: config.generation,
             shared,
-            workers,
+            acceptors,
             idle: Some(idle),
         },
         info,
     })
 }
 
-fn worker_loop(server: Arc<Server>, ctx: Arc<Handler>) {
-    loop {
-        if ctx.shared.stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let request = match server.recv() {
-            Ok(request) => request,
+fn accept_loop(listener: TcpListener, ctx: Arc<Handler>, shared: Arc<Shared>) {
+    while !shared.stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((sock, _)) => {
+                let ctx = Arc::clone(&ctx);
+                thread::spawn(move || handle_socket(sock, &ctx));
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(40));
+            }
             Err(_) => break,
-        };
-        if ctx.shared.stop.load(Ordering::SeqCst) {
-            break;
         }
-        note_activity(&ctx.shared);
-        handle_request(request, &ctx);
-        note_activity(&ctx.shared);
     }
+}
+
+fn handle_socket(mut sock: TcpStream, ctx: &Handler) {
+    let _ = sock.set_nodelay(true);
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = sock.set_write_timeout(Some(Duration::from_secs(60)));
+    let incoming = match read_incoming(
+        &mut sock,
+        ctx.max_file_bytes.saturating_add(MULTIPART_SLACK),
+    ) {
+        Ok(incoming) => incoming,
+        Err(SocketRead::Tls) => {
+            reset_connection(&sock);
+            return;
+        }
+        Err(_) => return,
+    };
+    note_activity(&ctx.shared);
+    let reply = dispatch(incoming, ctx);
+    let _ = write_reply(&mut sock, &reply);
+    let _ = sock.shutdown(Shutdown::Both);
+    note_activity(&ctx.shared);
 }
 
 fn idle_loop(shared: Arc<Shared>, idle_for: Duration, poll: Duration, on_idle: Notify) {
@@ -333,7 +357,6 @@ fn idle_loop(shared: Arc<Shared>, idle_for: Duration, poll: Duration, on_idle: N
         if elapsed >= idle_for {
             drop(guard);
             if !shared.stop.swap(true, Ordering::SeqCst) {
-                unblock(&shared);
                 on_idle();
             }
             return;
@@ -353,14 +376,6 @@ fn note_activity(shared: &Shared) {
     }
 }
 
-fn unblock(shared: &Shared) {
-    if let Ok(servers) = shared.servers.lock() {
-        for server in servers.iter() {
-            server.unblock();
-        }
-    }
-}
-
 impl Session {
     fn request_stop(&self) {
         if let Ok(guard) = self.shared.last_activity.lock() {
@@ -371,7 +386,6 @@ impl Session {
             self.shared.stop.store(true, Ordering::SeqCst);
             self.shared.wake.notify_all();
         }
-        unblock(&self.shared);
     }
 
     fn shutdown(self) {
@@ -383,9 +397,9 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.request_stop();
         let here = thread::current().id();
-        for worker in self.workers.drain(..) {
-            if worker.thread().id() != here {
-                let _ = worker.join();
+        for acceptor in self.acceptors.drain(..) {
+            if acceptor.thread().id() != here {
+                let _ = acceptor.join();
             }
         }
         if let Some(idle) = self.idle.take() {
@@ -405,15 +419,124 @@ struct Handler {
     nonce: AtomicU64,
 }
 
-fn handle_request(mut request: Request, ctx: &Handler) {
-    let response = match respond(&mut request, ctx) {
-        Ok(response) => response,
-        Err(error) => json_response(
-            error.status,
-            &format!(r#"{{"ok":false,"error":{}}}"#, json_string(&error.message)),
-        ),
+enum SocketRead {
+    Tls,
+    Failed,
+}
+
+struct Incoming {
+    method: String,
+    path: String,
+    content_type: String,
+    body: Vec<u8>,
+    too_large: bool,
+}
+
+struct Reply {
+    status: u16,
+    content_type: &'static str,
+    extra: &'static [(&'static str, &'static str)],
+    body: Vec<u8>,
+}
+
+fn read_incoming(sock: &mut TcpStream, limit: usize) -> Result<Incoming, SocketRead> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let header_end = loop {
+        let n = sock.read(&mut tmp).map_err(|_| SocketRead::Failed)?;
+        if n == 0 {
+            return Err(SocketRead::Failed);
+        }
+        if buf.is_empty() && tmp[0] == 0x16 {
+            return Err(SocketRead::Tls);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > 64 * 1024 {
+            return Err(SocketRead::Failed);
+        }
+        if let Some(end) = find_crlf_crlf(&buf) {
+            break end;
+        }
     };
-    let _ = request.respond(response);
+    let header_bytes = &buf[..header_end];
+    let mut rest = buf[header_end + 4..].to_vec();
+    let header_text = String::from_utf8_lossy(header_bytes);
+    let mut lines = header_text.split("\r\n");
+    let Some(request_line) = lines.next() else {
+        return Err(SocketRead::Failed);
+    };
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    let mut headers = Vec::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+    }
+    let content_type = header_lookup(&headers, "content-type").unwrap_or_default();
+    if let Some(length) =
+        header_lookup(&headers, "content-length").and_then(|value| value.parse::<usize>().ok())
+    {
+        if length > limit {
+            return Ok(Incoming {
+                method,
+                path,
+                content_type,
+                body: Vec::new(),
+                too_large: true,
+            });
+        }
+    }
+    let expect = header_lookup(&headers, "expect").unwrap_or_default();
+    if expect.to_ascii_lowercase().contains("100-continue") {
+        sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .map_err(|_| SocketRead::Failed)?;
+        sock.flush().map_err(|_| SocketRead::Failed)?;
+    }
+    if let Some(length) =
+        header_lookup(&headers, "content-length").and_then(|value| value.parse::<usize>().ok())
+    {
+        let body = read_exact(sock, &mut rest, length).map_err(|_| SocketRead::Failed)?;
+        return Ok(Incoming {
+            method,
+            path,
+            content_type,
+            body,
+            too_large: false,
+        });
+    }
+    if header_lookup(&headers, "transfer-encoding")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("chunked")
+    {
+        return match read_chunked(sock, &mut rest, limit) {
+            Ok(body) => Ok(Incoming {
+                method,
+                path,
+                content_type,
+                body,
+                too_large: false,
+            }),
+            Err(error) if error.kind() == ErrorKind::FileTooLarge => Ok(Incoming {
+                method,
+                path,
+                content_type,
+                body: Vec::new(),
+                too_large: true,
+            }),
+            Err(_) => Err(SocketRead::Failed),
+        };
+    }
+    Ok(Incoming {
+        method,
+        path,
+        content_type,
+        body: Vec::new(),
+        too_large: false,
+    })
 }
 
 #[derive(Debug)]
@@ -422,74 +545,247 @@ struct HttpError {
     message: String,
 }
 
-enum Verb {
-    Get,
-    Post,
-    Other,
-}
-
-fn respond(request: &mut Request, ctx: &Handler) -> Result<Response<Cursor<Vec<u8>>>, HttpError> {
-    let path = request.url().to_string();
-    let verb = match request.method() {
-        Method::Get => Verb::Get,
-        Method::Post => Verb::Post,
-        _ => Verb::Other,
-    };
-    let content_type = header_value(request, "Content-Type");
-    let mut body = Vec::new();
-    let limit = ctx.max_file_bytes.saturating_add(MULTIPART_SLACK);
-    request
-        .as_reader()
-        .take((limit + 1) as u64)
-        .read_to_end(&mut body)
-        .map_err(|_| HttpError::new(400, "Tuto could not read that upload."))?;
-    if body.len() > limit {
-        return Err(HttpError::new(413, "This file is larger than 25 MB."));
+fn dispatch(incoming: Incoming, ctx: &Handler) -> Reply {
+    if incoming.too_large {
+        return json_reply(
+            413,
+            r#"{"ok":false,"error":"This file is larger than 25 MB."}"#,
+        );
     }
-    let Some(token) = route_token(&path) else {
-        return Ok(text_response(404, "Not found."));
+    let Some(token) = route_token(&incoming.path) else {
+        return text_reply(404, "Not found.");
     };
     if !tokens_equal(token, &ctx.token) {
-        return Ok(text_response(404, "Not found."));
+        return text_reply(404, "Not found.");
     }
     if !ctx.shared.connected.swap(true, Ordering::SeqCst) {
         (ctx.on_seen)();
     }
-    match verb {
-        Verb::Get => Ok(html_response(PAGE)),
-        Verb::Post => {
-            let files = parse_uploads(&content_type.unwrap_or_default(), &body, ctx.max_file_bytes)?;
-            if files.is_empty() {
-                return Err(HttpError::new(400, "Choose a photo or a PDF."));
-            }
-            let mut saved = Vec::new();
-            for file in files {
-                if sniff_kind(&file.bytes).is_none() {
-                    let message = if is_heic(&file.bytes) {
-                        "This photo is HEIC. Set the camera to JPEG, or choose a JPEG, PNG, or PDF."
-                    } else {
-                        "Tuto reads JPEG, PNG, WebP, GIF, TIFF, and PDF."
-                    };
-                    return Err(HttpError::new(415, message));
-                }
-                let kind = sniff_kind(&file.bytes).unwrap_or("jpg");
-                let filename = safe_filename(&file.filename, kind);
-                let nonce = ctx.nonce.fetch_add(1, Ordering::Relaxed);
-                (ctx.on_file)(UploadedPaper {
-                    filename: filename.clone(),
-                    bytes: file.bytes,
-                    nonce,
-                })
-                .map_err(|error| HttpError::new(500, error))?;
-                saved.push(filename);
-            }
-            let name = saved.join(", ");
-            Ok(json_response(
-                200,
-                &format!(r#"{{"ok":true,"name":{}}}"#, json_string(&name)),
-            ))
+    match incoming.method.as_str() {
+        "GET" | "HEAD" => html_reply(PAGE),
+        "POST" => accept_post(incoming, ctx),
+        _ => text_reply(404, "Not found."),
+    }
+}
+
+fn accept_post(incoming: Incoming, ctx: &Handler) -> Reply {
+    let files = match parse_uploads(&incoming.content_type, &incoming.body, ctx.max_file_bytes) {
+        Ok(files) => files,
+        Err(error) => return json_reply(error.status, &json_error(&error.message)),
+    };
+    if files.is_empty() {
+        return json_reply(400, r#"{"ok":false,"error":"Choose a photo or a PDF."}"#);
+    }
+    let mut saved = Vec::new();
+    let mut papers = Vec::new();
+    for file in files {
+        if sniff_kind(&file.bytes).is_none() {
+            let message = if is_heic(&file.bytes) {
+                "This photo is HEIC. On the phone, set the camera to JPEG and take it again."
+            } else {
+                "Tuto reads JPEG, PNG, WebP, GIF, TIFF, and PDF."
+            };
+            return json_reply(415, &json_error(message));
         }
-        Verb::Other => Ok(text_response(404, "Not found.")),
+        let kind = sniff_kind(&file.bytes).unwrap_or("jpg");
+        let filename = safe_filename(&file.filename, kind);
+        let nonce = ctx.nonce.fetch_add(1, Ordering::Relaxed);
+        papers.push(UploadedPaper {
+            filename: filename.clone(),
+            bytes: file.bytes,
+            nonce,
+        });
+        saved.push(filename);
+    }
+    let on_file = Arc::clone(&ctx.on_file);
+    thread::spawn(move || {
+        for paper in papers {
+            let _ = on_file(paper);
+        }
+    });
+    let name = saved.join(", ");
+    json_reply(
+        200,
+        &format!(r#"{{"ok":true,"name":{}}}"#, json_string(&name)),
+    )
+}
+
+fn json_error(message: &str) -> String {
+    format!(r#"{{"ok":false,"error":{}}}"#, json_string(message))
+}
+
+fn html_reply(body: &str) -> Reply {
+    Reply {
+        status: 200,
+        content_type: "text/html; charset=utf-8",
+        extra: &[
+            ("Cache-Control", "no-store"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+            (
+                "Content-Security-Policy",
+                "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'self'",
+            ),
+        ],
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+fn text_reply(status: u16, body: &str) -> Reply {
+    Reply {
+        status,
+        content_type: "text/plain; charset=utf-8",
+        extra: &[("Cache-Control", "no-store")],
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+fn json_reply(status: u16, body: &str) -> Reply {
+    Reply {
+        status,
+        content_type: "application/json; charset=utf-8",
+        extra: &[("Cache-Control", "no-store")],
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+fn write_reply(sock: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        reply.status,
+        reason(reply.status),
+        reply.content_type,
+        reply.body.len()
+    );
+    for (name, value) in reply.extra {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    sock.write_all(head.as_bytes())?;
+    sock.write_all(&reply.body)?;
+    sock.flush()
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        500 => "Internal Server Error",
+        _ => "Error",
+    }
+}
+
+fn header_lookup(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.clone())
+}
+
+fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn read_exact(
+    sock: &mut TcpStream,
+    already: &mut Vec<u8>,
+    length: usize,
+) -> std::io::Result<Vec<u8>> {
+    if already.len() >= length {
+        let body = already[..length].to_vec();
+        already.drain(..length);
+        return Ok(body);
+    }
+    let mut body = std::mem::take(already);
+    let start = body.len();
+    body.resize(length, 0);
+    let mut filled = start;
+    while filled < length {
+        match sock.read(&mut body[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "upload ended early",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(body)
+}
+
+fn read_chunked(
+    sock: &mut TcpStream,
+    already: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut pending = std::mem::take(already);
+    let mut body = Vec::new();
+    loop {
+        let line = read_line(sock, &mut pending)?;
+        let size_hex = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16).unwrap_or(usize::MAX);
+        if size == usize::MAX {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "bad chunk"));
+        }
+        if size == 0 {
+            let _ = read_line(sock, &mut pending);
+            break;
+        }
+        if body.len().saturating_add(size) > limit {
+            return Err(std::io::Error::new(
+                ErrorKind::FileTooLarge,
+                "upload too large",
+            ));
+        }
+        let chunk = read_exact(sock, &mut pending, size)?;
+        body.extend_from_slice(&chunk);
+        let _ = read_line(sock, &mut pending);
+    }
+    Ok(body)
+}
+
+fn read_line(sock: &mut TcpStream, pending: &mut Vec<u8>) -> std::io::Result<String> {
+    loop {
+        if let Some(end) = pending.windows(2).position(|window| window == b"\r\n") {
+            let line = String::from_utf8_lossy(&pending[..end]).into_owned();
+            pending.drain(..end + 2);
+            return Ok(line);
+        }
+        if pending.len() > 8192 {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "line too long"));
+        }
+        let mut tmp = [0u8; 1024];
+        match sock.read(&mut tmp) {
+            Ok(0) => return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "closed")),
+            Ok(n) => pending.extend_from_slice(&tmp[..n]),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn reset_connection(sock: &TcpStream) {
+    unsafe {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        );
     }
 }
 
@@ -500,67 +796,6 @@ impl HttpError {
             message: message.into(),
         }
     }
-}
-
-fn html_response(body: &str) -> Response<Cursor<Vec<u8>>> {
-    with_headers(
-        Response::from_data(body.as_bytes().to_vec()),
-        200,
-        &[
-            ("Content-Type", "text/html; charset=utf-8"),
-            ("Cache-Control", "no-store"),
-            ("X-Content-Type-Options", "nosniff"),
-            ("Referrer-Policy", "no-referrer"),
-            (
-                "Content-Security-Policy",
-                "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'self'",
-            ),
-        ],
-    )
-}
-
-fn text_response(status: u16, body: &str) -> Response<Cursor<Vec<u8>>> {
-    with_headers(
-        Response::from_data(body.as_bytes().to_vec()),
-        status,
-        &[
-            ("Content-Type", "text/plain; charset=utf-8"),
-            ("Cache-Control", "no-store"),
-        ],
-    )
-}
-
-fn json_response(status: u16, body: &str) -> Response<Cursor<Vec<u8>>> {
-    with_headers(
-        Response::from_data(body.as_bytes().to_vec()),
-        status,
-        &[
-            ("Content-Type", "application/json; charset=utf-8"),
-            ("Cache-Control", "no-store"),
-        ],
-    )
-}
-
-fn with_headers(
-    response: Response<Cursor<Vec<u8>>>,
-    status: u16,
-    headers: &[(&str, &str)],
-) -> Response<Cursor<Vec<u8>>> {
-    let mut response = response.with_status_code(StatusCode(status));
-    for (name, value) in headers {
-        if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-            response = response.with_header(header);
-        }
-    }
-    response
-}
-
-fn header_value(request: &Request, name: &'static str) -> Option<String> {
-    request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv(name))
-        .map(|header| header.value.as_str().trim().to_string())
 }
 
 fn json_string(value: &str) -> String {
@@ -619,8 +854,20 @@ fn is_private_lan(ip: Ipv4Addr) -> bool {
 fn skip_interface(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     [
-        "docker", "veth", "br-", "virbr", "tun", "tap", "wg", "tailscale", "zt", "flannel", "cni",
-        "vboxnet", "vmnet", "lo",
+        "docker",
+        "veth",
+        "br-",
+        "virbr",
+        "tun",
+        "tap",
+        "wg",
+        "tailscale",
+        "zt",
+        "flannel",
+        "cni",
+        "vboxnet",
+        "vmnet",
+        "lo",
     ]
     .iter()
     .any(|prefix| name.starts_with(prefix))
@@ -637,7 +884,11 @@ fn interface_rank(name: &str) -> u8 {
     }
 }
 
-fn bind_listeners(addrs: &[LanAddr], port_start: u16, attempts: u16) -> Result<(u16, Vec<Server>), String> {
+fn bind_listeners(
+    addrs: &[LanAddr],
+    port_start: u16,
+    attempts: u16,
+) -> Result<(u16, Vec<TcpListener>), String> {
     if addrs.is_empty() {
         return Err("Tuto could not find a local network address.".into());
     }
@@ -650,16 +901,13 @@ fn bind_listeners(addrs: &[LanAddr], port_start: u16, attempts: u16) -> Result<(
         if addrs.len() != 1 {
             return Err("Phone drop could not listen.".into());
         }
-        let server = Server::http(SocketAddr::from((addrs[0].ip, 0)))
+        let listener = TcpListener::bind(SocketAddr::from((addrs[0].ip, 0)))
             .map_err(|error| format!("Phone drop could not listen. {error}"))?;
-        let port = match server.server_addr() {
-            ListenAddr::IP(addr) => addr.port(),
-            #[cfg(unix)]
-            ListenAddr::Unix(_) => {
-                return Err("Phone drop could not listen.".into());
-            }
-        };
-        return Ok((port, vec![server]));
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        return Ok((port, vec![listener]));
     }
     let mut last_error = String::from("the port is in use");
     let attempts = attempts.max(1);
@@ -667,11 +915,11 @@ fn bind_listeners(addrs: &[LanAddr], port_start: u16, attempts: u16) -> Result<(
         let Some(port) = port_start.checked_add(offset) else {
             break;
         };
-        let mut servers = Vec::new();
+        let mut listeners = Vec::new();
         let mut failed = false;
         for addr in addrs {
-            match Server::http(SocketAddr::from((addr.ip, port))) {
-                Ok(server) => servers.push(server),
+            match TcpListener::bind(SocketAddr::from((addr.ip, port))) {
+                Ok(listener) => listeners.push(listener),
                 Err(error) => {
                     last_error = error.to_string();
                     failed = true;
@@ -680,7 +928,7 @@ fn bind_listeners(addrs: &[LanAddr], port_start: u16, attempts: u16) -> Result<(
             }
         }
         if !failed {
-            return Ok((port, servers));
+            return Ok((port, listeners));
         }
     }
     Err(format!(
@@ -743,7 +991,11 @@ struct RawFile {
     bytes: Vec<u8>,
 }
 
-fn parse_uploads(content_type: &str, body: &[u8], max_file_bytes: usize) -> Result<Vec<RawFile>, HttpError> {
+fn parse_uploads(
+    content_type: &str,
+    body: &[u8],
+    max_file_bytes: usize,
+) -> Result<Vec<RawFile>, HttpError> {
     let boundary = multipart_boundary(content_type)
         .ok_or_else(|| HttpError::new(400, "Choose a photo or a PDF."))?;
     let mut files = Vec::new();
@@ -775,7 +1027,12 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
             continue;
         };
         let value = value.trim().trim_matches('"');
-        if value.is_empty() || value.len() > 70 || value.as_bytes().iter().any(|byte| byte.is_ascii_whitespace())
+        if value.is_empty()
+            || value.len() > 70
+            || value
+                .as_bytes()
+                .iter()
+                .any(|byte| byte.is_ascii_whitespace())
         {
             return None;
         }
@@ -847,7 +1104,10 @@ fn filename_from_disposition(value: &str) -> Option<String> {
             .map(str::trim)
             .map(str::to_string)
     }) {
-        let encoded = star.split_once("''").map(|(_, rest)| rest).unwrap_or(star.as_str());
+        let encoded = star
+            .split_once("''")
+            .map(|(_, rest)| rest)
+            .unwrap_or(star.as_str());
         let decoded = percent_decode(encoded.trim_matches('"'));
         if !decoded.is_empty() {
             return Some(decoded);
@@ -957,12 +1217,17 @@ fn sniff_kind(bytes: &[u8]) -> Option<&'static str> {
 fn is_heic(bytes: &[u8]) -> bool {
     bytes.len() >= 12
         && &bytes[4..8] == b"ftyp"
-        && matches!(&bytes[8..12], b"heic" | b"heix" | b"heif" | b"mif1" | b"hevc")
+        && matches!(
+            &bytes[8..12],
+            b"heic" | b"heix" | b"heif" | b"mif1" | b"hevc"
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
     use std::process::Command;
     use std::sync::Mutex as StdMutex;
 
@@ -984,7 +1249,10 @@ mod tests {
             addr("en0", "169.254.1.1"),
         ]);
         let ips: Vec<_> = found.iter().map(|item| item.ip.to_string()).collect();
-        assert_eq!(ips, vec!["192.168.1.20".to_string(), "172.30.0.2".to_string()]);
+        assert_eq!(
+            ips,
+            vec!["192.168.1.20".to_string(), "172.30.0.2".to_string()]
+        );
         assert!(found[0].name == "wlan0");
     }
 
@@ -1011,7 +1279,10 @@ mod tests {
     fn route_requires_the_session_token() {
         let token = "ab".repeat(32);
         assert_eq!(route_token(&format!("/drop/{token}")), Some(token.as_str()));
-        assert_eq!(route_token(&format!("/drop/{token}/")), Some(token.as_str()));
+        assert_eq!(
+            route_token(&format!("/drop/{token}/")),
+            Some(token.as_str())
+        );
         assert!(route_token("/drop/short").is_none());
         assert!(route_token("/").is_none());
         assert!(route_token(&format!("/drop/{token}/extra")).is_none());
@@ -1064,6 +1335,9 @@ PNG\r\n\
         assert!(PAGE.contains("Take photo"));
         assert!(PAGE.contains("Choose files"));
         assert!(PAGE.contains("25 * 1024 * 1024"));
+        assert!(PAGE.contains("Trying again"));
+        assert!(PAGE.contains("HTTP "));
+        assert!(PAGE.contains(".heic"));
         let lower = PAGE.to_ascii_lowercase();
         assert!(!lower.contains("http://"));
         assert!(!lower.contains("https://"));
@@ -1080,11 +1354,11 @@ PNG\r\n\
 
     fn tiny_png() -> Vec<u8> {
         vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
-            0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-            0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
-            0xCF, 0xC0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x18, 0xDD, 0x8D, 0xB4, 0x00, 0x00, 0x00,
-            0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x18, 0xDD, 0x8D,
+            0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ]
     }
 
@@ -1107,10 +1381,7 @@ PNG\r\n\
         let slot: Arc<StdMutex<Option<Session>>> = Arc::new(StdMutex::new(None));
         let files_cb = Arc::clone(&files);
         let on_file: FileHandler = Arc::new(move |paper| {
-            files_cb
-                .lock()
-                .unwrap()
-                .push((paper.filename, paper.bytes));
+            files_cb.lock().unwrap().push((paper.filename, paper.bytes));
             Ok(())
         });
         let slot_idle = Arc::clone(&slot);
@@ -1170,6 +1441,12 @@ PNG\r\n\
             &server.info.primary_url,
         ]);
         assert_eq!(String::from_utf8_lossy(&page.stdout).trim(), "200");
+        let headers = curl(&["-sSI", &server.info.primary_url]);
+        let headers = String::from_utf8_lossy(&headers.stdout);
+        assert!(
+            headers.to_ascii_lowercase().contains("connect-src 'self'"),
+            "{headers}"
+        );
 
         let wrong = curl(&[
             "-sS",
@@ -1177,7 +1454,11 @@ PNG\r\n\
             "/dev/null",
             "-w",
             "%{http_code}",
-            &format!("http://127.0.0.1:{}/drop/{}", server.info.port, "ab".repeat(32)),
+            &format!(
+                "http://127.0.0.1:{}/drop/{}",
+                server.info.port,
+                "ab".repeat(32)
+            ),
         ]);
         assert_eq!(String::from_utf8_lossy(&wrong.stdout).trim(), "404");
 
@@ -1202,6 +1483,7 @@ PNG\r\n\
         let uploaded = String::from_utf8_lossy(&uploaded.stdout);
         assert!(uploaded.contains("\"ok\":true"), "{uploaded}");
         assert!(uploaded.trim().ends_with("200"), "{uploaded}");
+        wait_until(|| server.files.lock().unwrap().len() == 1);
         let saved = server.files.lock().unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].0, "receipt.png");
@@ -1249,7 +1531,499 @@ PNG\r\n\
             "%{http_code}",
             &format!("http://127.0.0.1:{port}/drop/{}", "ab".repeat(32)),
         ]);
-        assert!(!probed.status.success(), "idle server still accepted traffic");
+        assert!(
+            !probed.status.success(),
+            "idle server still accepted traffic"
+        );
         assert!(server.slot.lock().unwrap().is_none());
     }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if ready() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for the upload to be recorded");
+    }
+
+    fn jpeg_bytes(size: usize) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        bytes.resize(size, 0x11);
+        bytes
+    }
+
+    fn post_multipart(url: &str, filename: &str, bytes: &[u8], extra: &[&str]) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "tuto-phone-{}-{}",
+            std::process::id(),
+            filename.replace('.', "-")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(filename);
+        std::fs::write(&path, bytes).unwrap();
+        let mut args = vec![
+            "-sS".to_string(),
+            "--max-time".to_string(),
+            "20".to_string(),
+            "-w".to_string(),
+            "\n%{http_code}".to_string(),
+            "-F".to_string(),
+            format!("file=@{};filename={}", path.display(), filename),
+        ];
+        for flag in extra {
+            args.push((*flag).to_string());
+        }
+        args.push(url.to_string());
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = curl(&arg_refs);
+        let _ = std::fs::remove_dir_all(&dir);
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    #[test]
+    fn tls_client_hello_is_reset_without_an_http_reply() {
+        let server = serve_loopback(1024, Duration::from_secs(30));
+        let mut sock = TcpStream::connect(("127.0.0.1", server.info.port)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let started = Instant::now();
+        sock.write_all(&[0x16, 0x03, 0x01, 0x00, 0x2a, 0x01, 0x00, 0x00, 0x26])
+            .unwrap();
+        let mut buf = [0u8; 32];
+        let read = sock.read(&mut buf);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "tls probe hung for {:?}",
+            started.elapsed()
+        );
+        match read {
+            Ok(0) => {}
+            Ok(n) => assert!(
+                !buf[..n].starts_with(b"HTTP"),
+                "wrote http into a tls handshake: {:?}",
+                &buf[..n]
+            ),
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn large_uploads_return_before_ocr_and_accept_continue_and_chunked() {
+        let files = Arc::new(StdMutex::new(Vec::new()));
+        let slot: Arc<StdMutex<Option<Session>>> = Arc::new(StdMutex::new(None));
+        let files_cb = Arc::clone(&files);
+        let on_file: FileHandler = Arc::new(move |paper| {
+            thread::sleep(Duration::from_millis(2000));
+            files_cb
+                .lock()
+                .unwrap()
+                .push((paper.filename.clone(), paper.bytes.len()));
+            Ok(())
+        });
+        let slot_idle = Arc::clone(&slot);
+        let started = open_server(OpenConfig {
+            bind: vec![LanAddr {
+                name: "lo".into(),
+                ip: Ipv4Addr::LOCALHOST,
+            }],
+            port_start: 0,
+            port_attempts: 1,
+            idle: Duration::from_secs(60),
+            poll: Duration::from_millis(40),
+            max_file_bytes: 25 * 1024 * 1024,
+            on_file,
+            on_seen: Arc::new(|| {}),
+            on_idle: Arc::new(move || {
+                if let Some(session) = slot_idle.lock().unwrap().take() {
+                    session.shutdown();
+                }
+            }),
+            generation: 2,
+        })
+        .unwrap();
+        let info = started.info.clone();
+        *slot.lock().unwrap() = Some(started.session);
+        let url = info.primary_url.clone();
+
+        let slow = jpeg_bytes(6 * 1024 * 1024);
+        let started_at = Instant::now();
+        let response = post_multipart(&url, "slow.jpg", &slow, &[]);
+        assert!(
+            started_at.elapsed() < Duration::from_millis(1500),
+            "response waited on the import callback: {:?} {response}",
+            started_at.elapsed()
+        );
+        assert!(response.contains("\"ok\":true"), "{response}");
+        assert!(response.trim().ends_with("200"), "{response}");
+
+        let photo = jpeg_bytes(5 * 1024 * 1024);
+        let url_a = url.clone();
+        let url_b = url.clone();
+        let url_c = url.clone();
+        let photo_a = photo.clone();
+        let photo_b = photo.clone();
+        let photo_c = photo;
+        let first = thread::spawn(move || post_multipart(&url_a, "a.jpg", &photo_a, &[]));
+        let second = thread::spawn(move || post_multipart(&url_b, "b.jpg", &photo_b, &[]));
+        let third = thread::spawn(move || post_multipart(&url_c, "c.jpg", &photo_c, &[]));
+        for (name, handle) in [("a", first), ("b", second), ("c", third)] {
+            let body = handle.join().unwrap();
+            assert!(body.contains("\"ok\":true"), "{name}: {body}");
+            assert!(body.trim().ends_with("200"), "{name}: {body}");
+        }
+
+        let continued = jpeg_bytes(1024 * 1024);
+        let continued_body = post_multipart(
+            &url,
+            "continued.jpg",
+            &continued,
+            &["-H", "Expect: 100-continue"],
+        );
+        assert!(continued_body.contains("\"ok\":true"), "{continued_body}");
+
+        let chunk = jpeg_bytes(256 * 1024);
+        let boundary = "tutoBoundary";
+        let mut multipart = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"chunked.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n"
+        )
+        .into_bytes();
+        multipart.extend_from_slice(&chunk);
+        multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut sock = TcpStream::connect(("127.0.0.1", info.port)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let head = format!(
+            "POST /drop/{} HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nConnection: close\r\n\r\n{:X}\r\n",
+            info.token,
+            multipart.len()
+        );
+        sock.write_all(head.as_bytes()).unwrap();
+        sock.write_all(&multipart).unwrap();
+        sock.write_all(b"\r\n0\r\n\r\n").unwrap();
+        let mut chunked_reply = String::new();
+        sock.read_to_string(&mut chunked_reply).unwrap();
+        assert!(chunked_reply.contains("200"), "{chunked_reply}");
+        assert!(chunked_reply.contains("\"ok\":true"), "{chunked_reply}");
+
+        let mut huge = TcpStream::connect(("127.0.0.1", info.port)).unwrap();
+        huge.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let request = format!(
+            "POST /drop/{} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            info.token,
+            40 * 1024 * 1024
+        );
+        huge.write_all(request.as_bytes()).unwrap();
+        let mut huge_reply = String::new();
+        let _ = huge.read_to_string(&mut huge_reply);
+        assert!(huge_reply.contains("413"), "{huge_reply}");
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(8) {
+            if files.lock().unwrap().len() >= 6 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let saved = files.lock().unwrap();
+        assert!(
+            saved.len() >= 6,
+            "expected the slow import to record every accepted file, got {saved:?}"
+        );
+        if let Some(session) = slot.lock().unwrap().take() {
+            session.shutdown();
+        }
+    }
+
+    #[test]
+    fn headless_chrome_uploads_large_jpegs() {
+        let bind = lan_interfaces()
+            .ok()
+            .and_then(|list| list.into_iter().next())
+            .unwrap_or(LanAddr {
+                name: "lo".into(),
+                ip: Ipv4Addr::LOCALHOST,
+            });
+        let files = Arc::new(StdMutex::new(Vec::new()));
+        let slot: Arc<StdMutex<Option<Session>>> = Arc::new(StdMutex::new(None));
+        let files_cb = Arc::clone(&files);
+        let on_file: FileHandler = Arc::new(move |paper| {
+            files_cb.lock().unwrap().push(paper.filename);
+            Ok(())
+        });
+        let slot_idle = Arc::clone(&slot);
+        let started = open_server(OpenConfig {
+            bind: vec![bind.clone()],
+            port_start: 0,
+            port_attempts: 1,
+            idle: Duration::from_secs(120),
+            poll: Duration::from_millis(40),
+            max_file_bytes: 25 * 1024 * 1024,
+            on_file,
+            on_seen: Arc::new(|| {}),
+            on_idle: Arc::new(move || {
+                if let Some(session) = slot_idle.lock().unwrap().take() {
+                    session.shutdown();
+                }
+            }),
+            generation: 3,
+        })
+        .unwrap();
+        let info = started.info.clone();
+        *slot.lock().unwrap() = Some(started.session);
+
+        let dir = std::env::temp_dir().join(format!("tuto-chrome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = Vec::new();
+        for (name, size) in [("cam-a.jpg", 6), ("cam-b.jpg", 7), ("cam-c.jpg", 8)] {
+            let path = dir.join(name);
+            std::fs::write(&path, jpeg_bytes(size * 1024 * 1024)).unwrap();
+            paths.push(path);
+        }
+        let debug_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let profile = dir.join("chrome-profile");
+        let chrome_log = std::fs::File::create(dir.join("chrome.log")).unwrap();
+        let chrome = Command::new("google-chrome")
+            .args([
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--no-first-run",
+                "--enable-features=HttpsUpgrades",
+                &format!("--remote-debugging-port={debug_port}"),
+                "--remote-debugging-address=127.0.0.1",
+                "--remote-allow-origins=*",
+                &format!("--user-data-dir={}", profile.display()),
+                "about:blank",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(chrome_log))
+            .spawn()
+            .expect("google-chrome is installed");
+        struct KillChild(std::process::Child);
+        impl Drop for KillChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let chrome = KillChild(chrome);
+        let script = dir.join("upload.mjs");
+        std::fs::write(&script, super::CHROME_UPLOAD_SCRIPT).unwrap();
+        let mut args = vec![
+            script.to_string_lossy().into_owned(),
+            debug_port.to_string(),
+            info.primary_url.clone(),
+        ];
+        for path in &paths {
+            args.push(path.to_string_lossy().into_owned());
+        }
+        let output = Command::new("node")
+            .args(&args)
+            .output()
+            .expect("node is installed");
+        let report = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            let err = std::fs::read_to_string(dir.join("chrome.log")).unwrap_or_default();
+            panic!("chrome upload failed\n{report}\nchrome: {err}");
+        }
+        assert!(
+            report.contains("parallel-ok"),
+            "browser fetch did not accept the large photos\n{report}"
+        );
+        assert!(
+            report.contains("page-ok"),
+            "the phone page did not save the files one at a time\n{report}"
+        );
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if files.lock().unwrap().len() >= 6 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        let saved = files.lock().unwrap().clone();
+        assert!(saved.len() >= 6, "server recorded {saved:?}\n{report}");
+        drop(chrome);
+        if let Some(session) = slot.lock().unwrap().take() {
+            session.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
+#[cfg(test)]
+const CHROME_UPLOAD_SCRIPT: &str = r#"
+import { request } from 'node:http';
+
+const [port, pageUrl, ...files] = process.argv.slice(2);
+
+function get(url) {
+  return new Promise((resolve, reject) => {
+    const req = request(url, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => resolve(body));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function version() {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      return JSON.parse(await get(`http://127.0.0.1:${port}/json/version`));
+    } catch (error) {
+      await sleep(200);
+    }
+  }
+  throw new Error('chrome devtools did not open');
+}
+
+function rpc(ws) {
+  let next = 0;
+  const pending = new Map();
+  ws.addEventListener('message', (event) => {
+    const message = JSON.parse(event.data);
+    if (message.id && pending.has(message.id)) {
+      pending.get(message.id)(message);
+      pending.delete(message.id);
+    }
+  });
+  return (method, params) => new Promise((resolve, reject) => {
+    const id = ++next;
+    const timer = setTimeout(() => reject(new Error(`timeout ${method}`)), 30000);
+    pending.set(id, (message) => {
+      clearTimeout(timer);
+      if (message.error) {
+        reject(new Error(JSON.stringify(message.error)));
+        return;
+      }
+      resolve(message.result ?? {});
+    });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+}
+
+const browserInfo = await version();
+const browser = new WebSocket(browserInfo.webSocketDebuggerUrl);
+await new Promise((resolve, reject) => {
+  browser.addEventListener('open', resolve);
+  browser.addEventListener('error', () => reject(new Error('devtools websocket failed')));
+});
+const browserCall = rpc(browser);
+const created = await browserCall('Target.createTarget', { url: pageUrl });
+let page = null;
+for (let attempt = 0; attempt < 30; attempt += 1) {
+  const list = JSON.parse(await get(`http://127.0.0.1:${port}/json/list`));
+  page = list.find((item) => item.id === created.targetId);
+  if (page && page.webSocketDebuggerUrl) break;
+  await sleep(200);
+}
+if (!page) throw new Error('chrome did not open the drop page');
+const pageWs = new WebSocket(page.webSocketDebuggerUrl);
+await new Promise((resolve, reject) => {
+  pageWs.addEventListener('open', resolve);
+  pageWs.addEventListener('error', () => reject(new Error('page websocket failed')));
+});
+const call = rpc(pageWs);
+await call('Runtime.enable');
+await call('Page.enable');
+await call('DOM.enable');
+let text = '';
+for (let attempt = 0; attempt < 40; attempt += 1) {
+  const evaluated = await call('Runtime.evaluate', {
+    expression: 'document.body ? document.body.innerText : ""',
+    returnByValue: true,
+  });
+  text = evaluated.result?.value || '';
+  if (text.includes('Send papers')) break;
+  await sleep(250);
+}
+if (!text.includes('Send papers')) {
+  const where = await call('Runtime.evaluate', { expression: 'location.href', returnByValue: true });
+  throw new Error('page did not load over http: ' + text + ' url=' + (where.result?.value || ''));
+}
+const parallel = await call('Runtime.evaluate', {
+  expression: `(async () => {
+    function jpeg(size) {
+      const bytes = new Uint8Array(size);
+      bytes[0] = 0xff; bytes[1] = 0xd8; bytes[2] = 0xff; bytes[3] = 0xe0;
+      return new Blob([bytes], { type: 'image/jpeg' });
+    }
+    const jobs = [
+      ['p-6.jpg', 6 * 1024 * 1024],
+      ['p-7.jpg', 7 * 1024 * 1024],
+      ['p-8.jpg', 8 * 1024 * 1024],
+    ];
+    const results = await Promise.all(jobs.map(async ([name, size]) => {
+      const body = new FormData();
+      body.append('file', jpeg(size), name);
+      try {
+        const response = await fetch(location.pathname, { method: 'POST', body });
+        const payload = await response.text();
+        return response.status + ' ' + payload;
+      } catch (error) {
+        return 'ERR ' + (error && error.message ? error.message : 'failed');
+      }
+    }));
+    return results.join(' | ');
+  })()`,
+  awaitPromise: true,
+  returnByValue: true,
+});
+const parallelText = parallel.result?.value || JSON.stringify(parallel);
+console.log(parallelText);
+if (!parallelText.includes('200') || parallelText.includes('ERR') || parallelText.split('200').length < 4) {
+  throw new Error('parallel browser upload failed');
+}
+console.log('parallel-ok');
+const documentNode = await call('DOM.getDocument', { depth: 1 });
+const input = await call('DOM.querySelector', {
+  nodeId: documentNode.root.nodeId,
+  selector: '#library',
+});
+await call('DOM.setFileInputFiles', { nodeId: input.nodeId, files });
+let pageText = '';
+for (let attempt = 0; attempt < 40; attempt += 1) {
+  const evaluated = await call('Runtime.evaluate', {
+    expression: 'document.getElementById("list").innerText',
+    returnByValue: true,
+  });
+  pageText = evaluated.result?.value || '';
+  const saved = pageText.split('Saved on the laptop').length - 1;
+  if (saved >= 3) break;
+  if (pageText.includes('HTTP ') || pageText.includes('network error') || pageText.includes('timed out')) {
+    throw new Error(pageText);
+  }
+  await sleep(250);
+}
+console.log(pageText);
+if (pageText.split('Saved on the laptop').length - 1 < 3) {
+  throw new Error('page did not finish one-at-a-time uploads: ' + pageText);
+}
+console.log('page-ok');
+process.exit(0);
+"#;

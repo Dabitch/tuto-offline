@@ -165,23 +165,17 @@
         row.state.className = ok ? "state ok" : "state bad";
       }
 
-      function send(file, done) {
-        var row = rowFor(file);
-        if (file.size > limit) {
-          finish(row, false, "Larger than 25 MB.");
-          done();
-          return;
-        }
+      function attempt(file, row, triesLeft, done) {
         var xhr = new XMLHttpRequest();
         xhr.open("POST", location.pathname);
-        xhr.timeout = 120000;
+        xhr.timeout = 180000;
         xhr.upload.onprogress = function (event) {
           if (!event.lengthComputable || event.total === 0) {
             return;
           }
           var pct = Math.round((event.loaded / event.total) * 100);
           row.fill.style.width = pct + "%";
-          row.state.textContent = pct >= 100 ? "Reading on the laptop…" : "Sending " + pct + "%";
+          row.state.textContent = pct >= 100 ? "Waiting for the laptop…" : "Sending " + pct + "%";
         };
         xhr.onload = function () {
           var data = {};
@@ -192,23 +186,48 @@
           }
           if (xhr.status >= 200 && xhr.status < 300 && data.ok) {
             finish(row, true, "\u2713 Saved on the laptop");
-          } else {
-            finish(row, false, data.error || "The laptop could not take this file.");
+            done();
+            return;
           }
+          var detail = data.error || ("HTTP " + xhr.status);
+          finish(row, false, detail);
           done();
         };
-        xhr.onerror = function () {
-          finish(row, false, "Could not reach the laptop. Stay on the same Wi-Fi and try again.");
+        function again(label) {
+          if (triesLeft > 1) {
+            row.state.textContent = "Trying again…";
+            setTimeout(function () { attempt(file, row, triesLeft - 1, done); }, 700);
+            return;
+          }
+          finish(row, false, label);
           done();
+        }
+        xhr.onerror = function () {
+          again("Could not reach the laptop (network error). Stay on the same Wi-Fi and try again.");
         };
         xhr.ontimeout = function () {
-          finish(row, false, "The laptop took too long. Try a smaller photo.");
-          done();
+          again("The laptop took too long (timed out). Try a smaller photo.");
         };
         var body = new FormData();
         body.append("file", file, file.name || "photo");
-        row.state.textContent = "Sending…";
+        row.state.textContent = triesLeft < 3 ? "Trying again…" : "Sending…";
         xhr.send(body);
+      }
+
+      function send(file, done) {
+        var row = rowFor(file);
+        var name = (file.name || "").toLowerCase();
+        if (name.endsWith(".heic") || name.endsWith(".heif")) {
+          finish(row, false, "This photo is HEIC. Set the camera to JPEG and take it again.");
+          done();
+          return;
+        }
+        if (file.size > limit) {
+          finish(row, false, "Larger than 25 MB.");
+          done();
+          return;
+        }
+        attempt(file, row, 3, done);
       }
 
       function pump() {

@@ -25,8 +25,8 @@ serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-tiny_http = "0.12"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+libc = "0.2"
 if-addrs = "0.13"
 getrandom = "0.2"
 
